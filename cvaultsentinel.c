@@ -6,6 +6,7 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <inttypes.h>
 #include <string.h>
 #include <pthread.h>
 #include <unistd.h>
@@ -39,6 +40,15 @@
 
 static time_t global_start_time = 0;
 static int global_need_refresh = 0;
+
+#define XOR_BLOCK_NUM 4
+struct xor_block_st {
+	int num;
+	pthread_t thread;
+	pthread_mutex_t mutex;
+	uint32_t key;
+}; 
+static struct xor_block_st xor_data[XOR_BLOCK_NUM];
 
 // Multithreaded HTTP server
 struct http_worker {
@@ -110,6 +120,9 @@ void *http_dispatch(void *arg) {
 typedef int (*function_url_handler_t)(struct evhttp_request *, struct evbuffer *);
 int www_root_handler(struct evhttp_request *, struct evbuffer *);
 int www_status_handler(struct evhttp_request *, struct evbuffer *);
+#ifndef PRODUCTION_MODE
+int www_blockinfo_handler(struct evhttp_request *, struct evbuffer *);
+#endif
 
 // Array of URL's served by HTTP
 struct http_uri {
@@ -119,6 +132,9 @@ struct http_uri {
 } http_uri_list[] = {
 	{ "/", NULL, &www_root_handler}
 	,{ "/status", NULL, &www_status_handler}
+#ifndef PRODUCTION_MODE
+	,{ "/blockinfo", NULL, &www_blockinfo_handler}
+#endif
 	,{ NULL, NULL, NULL} // end of list
 }; // http_uri_list
 
@@ -202,6 +218,28 @@ void signal_handler(int sig) {
 	} // swtich
 } // signal_handler
 
+//  modify password data with xor (protection from Meltdown, Spectre type of attack)
+void *xor_block(void *data) {
+	TRACEFUNC
+
+	struct xor_block_st *me = data;
+	DEBUG("block = %d\n",me->num);
+
+	size_t myblock_len = gen_crypt_size / sizeof(uint32_t) / XOR_BLOCK_NUM;
+	uint32_t *myblock = (uint32_t *)&gen_crypt[me->num * (gen_crypt_size / XOR_BLOCK_NUM)];
+	
+	while (http_server_running) {
+		uint32_t new_xor_code = rand();
+		pthread_mutex_lock(&me->mutex);
+		for (size_t i = 0; i < myblock_len; ++i) {
+			myblock[i] = myblock[i] ^ me->key ^ new_xor_code;
+		}
+		me->key = new_xor_code;
+		pthread_mutex_unlock(&me->mutex);
+		sleep(1);
+	} // while
+	pthread_exit(NULL);
+} // xor_block()
 
 /*
  * MAIN
@@ -241,8 +279,21 @@ int main(int argc, char **argv) {
 		}
 
 		evhttp_set_gencb(workers[i].http, http_process_request, (void *)&workers[i]);
-		pthread_create(&workers[i].thread, NULL, http_dispatch, (void *)&workers[i]);
+		if (0 != pthread_create(&workers[i].thread, NULL, http_dispatch, (void *)&workers[i])) {
+			fprintf(stderr, "Error: can't create pthread with %s()\n","http_dispatch");
+			return 5;
+		};
 	} // for accept
+
+	for (int i = 0; i < XOR_BLOCK_NUM; i++) {
+		xor_data[i].num = i;
+		xor_data[i].key = 0;
+		pthread_mutex_init(&xor_data[i].mutex, NULL);
+		if (0 != pthread_create(&xor_data[i].thread, NULL, xor_block, (void *)&xor_data[i])) {
+			fprintf(stderr, "Error: can't create pthread with %s()\n","xor_block");
+			return 6;
+		}
+	}
 	http_server_running = 1;
 
 #ifdef PRODUCTION_MODE
@@ -269,6 +320,10 @@ int main(int argc, char **argv) {
 
 	for (int i = 0; i < HTTP_THREADS_CAP; i++) {
 		pthread_join(workers[i].thread, NULL);
+	} // for join
+
+	for (int i = 0; i < XOR_BLOCK_NUM; i++) {
+		pthread_join(xor_data[i].thread, NULL);
 	} // for join
 
 	return 0;
@@ -341,3 +396,61 @@ int www_status_handler(struct evhttp_request *req, struct evbuffer *buf) {
 
 	return HTTP_OK;
 } // www_status_handler()
+
+
+#ifndef PRODUCTION_MODE
+/*
+ * HTTP URL: /www_blockinfo_handler
+ * Info page for N block of gen_crypt
+ */
+int www_blockinfo_handler(struct evhttp_request *req, struct evbuffer *buf) {
+	TRACEFUNC
+
+	if (!req || !buf) return HTTP_INTERNAL;
+
+	struct evkeyvalq urls;
+	struct evkeyval *url;
+	const char *uri;
+
+	char *block = NULL;
+
+	uri = evhttp_request_get_uri(req);
+	if (uri && evhttp_parse_query(uri, &urls) == 0) {
+		for (url = (&urls)->tqh_first; url; url = url->next.tqe_next) {
+			if (strcmp("block", url->key) == 0) { block = url->value; continue; }
+		}
+	};
+
+	if (!block) return HTTP_BADREQUEST; // HTTP 400
+
+	int num = atoi(block);
+
+	W("<html>");
+	W("<head>");
+	W("<title>%s: %s</title>",PROJECT_TITLE,"Block info");
+	W("</head>");
+	W("<body bgcolor=white link=blue>");
+	W("<h1>%s: %s</h1>",PROJECT_TITLE,"Block info");
+	if (num >= 0 && num < XOR_BLOCK_NUM) {
+		W("<pre>");
+		W("Block #: %d\n", num);
+		pthread_mutex_lock(&xor_data[num].mutex);
+			W("Temp XOR key: %" PRIu32 "\n", xor_data[num].key);
+			W("Data (first 256 bytes):\n");
+			size_t start_addr = gen_crypt_size / XOR_BLOCK_NUM * num;
+			for (int i = 0; i <= 0xFF; i++) {
+				if (i % 16 == 0 && i > 0) W("\n");
+				W("%02X ", gen_crypt[start_addr + i]);
+			}
+		pthread_mutex_unlock(&xor_data[num].mutex);
+		W("</pre>");
+		W("<p><a href=/>[back]</a></p>");
+	} else {
+		W("<p><font color=red>Wrong block number: %d</font></p>",num);	
+	}
+	W("</body>");
+	W("</html>");
+
+	return HTTP_OK;
+} // www_status_handler()
+#endif
