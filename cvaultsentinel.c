@@ -16,6 +16,11 @@
 #include <event.h>
 #include <event2/thread.h>
 #include <evhttp.h>
+
+#include <openssl/conf.h>
+#include <openssl/evp.h>
+#include <openssl/err.h>
+
 #include "gen_table.h"
 
 #ifdef PRODUCTION_MODE
@@ -48,7 +53,14 @@ struct xor_block_st {
 	pthread_mutex_t mutex;
 	uint32_t key;
 }; 
-static struct xor_block_st xor_data[XOR_BLOCK_NUM];
+static struct xor_block_st xor_data[XOR_BLOCK_NUM] = {0};
+
+static const char base64[]=
+	"ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+	"abcdefghijklmnopqrstuvwxyz"
+	"0123456789+/";
+
+static char base64dec[256] = {0};
 
 // Multithreaded HTTP server
 struct http_worker {
@@ -120,6 +132,8 @@ void *http_dispatch(void *arg) {
 typedef int (*function_url_handler_t)(struct evhttp_request *, struct evbuffer *);
 int www_root_handler(struct evhttp_request *, struct evbuffer *);
 int www_status_handler(struct evhttp_request *, struct evbuffer *);
+int www_encrypt_handler(struct evhttp_request *, struct evbuffer *);
+int www_decrypt_handler(struct evhttp_request *, struct evbuffer *);
 #ifndef PRODUCTION_MODE
 int www_blockinfo_handler(struct evhttp_request *, struct evbuffer *);
 #endif
@@ -132,6 +146,8 @@ struct http_uri {
 } http_uri_list[] = {
 	{ "/", NULL, &www_root_handler}
 	,{ "/status", NULL, &www_status_handler}
+	,{ "/encrypt", NULL, &www_encrypt_handler}
+	,{ "/decrypt", NULL, &www_decrypt_handler}
 #ifndef PRODUCTION_MODE
 	,{ "/blockinfo", NULL, &www_blockinfo_handler}
 #endif
@@ -165,17 +181,19 @@ void http_process_request(struct evhttp_request *req, void *arg) {
 	}
 
 	char *path = evhttp_decode_uri(evhttp_uri_get_path(uri_parsed));
-
-	struct http_uri *u = http_uri_list;
-	while (u->uri) {
-		if (0 == strcmp(path, u->uri)) {
-			if (u->content_type) conttype = u->content_type;
-			http_code = u->handler(req, buf);
-			break;
-		}
-		u++;
-	} // while
-
+	if (path) {
+		struct http_uri *u = http_uri_list;
+		while (u->uri) {
+			if (0 == strcmp(path, u->uri)) {
+				if (u->content_type) conttype = u->content_type;
+				http_code = u->handler(req, buf);
+				break;
+			}
+			u++;
+		} // while
+		free(path);
+	} else http_code = HTTP_INTERNAL;
+	
 	switch (http_code) {
 	case HTTP_OK:
 		evhttp_add_header(req->output_headers, "Expires", "Mon, 01 Jan 1995 00:00:00 GMT");
@@ -191,6 +209,7 @@ void http_process_request(struct evhttp_request *req, void *arg) {
 	case HTTP_BADREQUEST: http_message = "Wrong request"; break;
 	case HTTP_NOTFOUND: http_message = "Not found"; break;
 	case HTTP_MOVEPERM: http_message = "Moved Permanently"; break;
+	case HTTP_BADMETHOD: http_message = "Bad method"; break;
 	default:
 		http_code = HTTP_INTERNAL;
 		http_message = "Internal server error";
@@ -224,6 +243,7 @@ void *xor_block(void *data) {
 
 	struct xor_block_st *me = data;
 	DEBUG("block = %d\n",me->num);
+	while (http_server_running != 1) {};
 
 	size_t myblock_len = gen_crypt_size / sizeof(uint32_t) / XOR_BLOCK_NUM;
 	uint32_t *myblock = (uint32_t *)&gen_crypt[me->num * (gen_crypt_size / XOR_BLOCK_NUM)];
@@ -241,6 +261,42 @@ void *xor_block(void *data) {
 	pthread_exit(NULL);
 } // xor_block()
 
+char *get_gen_crypt_part(size_t start, void *buf, size_t buf_size) {
+	size_t xor_block_size = gen_crypt_size / XOR_BLOCK_NUM;
+	start %= gen_crypt_size;
+	size_t block_start = (start % gen_crypt_size) / xor_block_size;
+	size_t block_end = ((start + buf_size) % gen_crypt_size) / xor_block_size;
+
+	uint32_t k[16]; // this is enought for AES key and iv arrays (don't use heap)
+	// uint32_t *k = calloc(buf_size / sizeof(uint32_t) + 2, sizeof(uint32_t));
+	// if (!k) return NULL;
+
+	size_t si = start / sizeof(uint32_t) % (xor_block_size / sizeof(uint32_t));
+	size_t se = ((start + buf_size) / sizeof(uint32_t) + 1) % (xor_block_size / sizeof(uint32_t));
+	uint32_t *block = (uint32_t *)&gen_crypt[block_start * xor_block_size];
+
+	size_t e = xor_block_size / sizeof(uint32_t) - si; // вышли за пределы блока
+	if (se >= si) e = se - si; // в пределах одного блока
+	uint32_t *p = k;
+	pthread_mutex_lock(&xor_data[block_start].mutex);
+		for (size_t i = 0; i <= e; ++i)
+			*p++ = block[si + i] ^ xor_data[block_start].key;
+	pthread_mutex_unlock(&xor_data[block_start].mutex);
+
+	if (se < si) {
+		block = (uint32_t *)&gen_crypt[block_end * xor_block_size];
+		pthread_mutex_lock(&xor_data[block_end].mutex);
+		for (size_t i = 0; i <= se; ++i)
+			*p++ = block[i + 1] ^ xor_data[block_end].key;
+		pthread_mutex_unlock(&xor_data[block_end].mutex);
+	}
+
+	memcpy(buf, (char *)k + start % sizeof(uint32_t), buf_size);
+	// free(k);
+	return buf;
+}
+
+
 /*
  * MAIN
  */
@@ -249,6 +305,12 @@ int main(int argc, char **argv) {
 
 	tzset();
 	global_start_time = time(NULL);
+	srand(global_start_time);
+
+	memset(base64dec, 0x80, sizeof(base64dec));
+	for (int i = 0; i < sizeof(base64) - 1; i++)
+		base64dec[(int)base64[i]] = (unsigned char) i;
+	base64dec['='] = 0;
 
 	evthread_use_pthreads();
 
@@ -293,13 +355,14 @@ int main(int argc, char **argv) {
 			fprintf(stderr, "Error: can't create pthread with %s()\n","xor_block");
 			return 6;
 		}
+		DEBUG("Thread #%d = %ld (num = %d)\n", i, xor_data[i].thread, xor_data[i].num);
 	}
 	http_server_running = 1;
 
 #ifdef PRODUCTION_MODE
 	if (daemon(0, 0) != 0) {
 		fprintf(stderr,"Can't daemonize process!\n");
-		return 5;
+		return 7;
 	};
 #endif
 
@@ -344,7 +407,18 @@ int www_root_handler(struct evhttp_request *req, struct evbuffer *buf) {
 	W("<body bgcolor=white link=blue>");
 	W("<h1>%s</h1>",PROJECT_TITLE);
 
-	W("<p>%s</p>","TODO");
+	W("<ul>"
+	"<li><a href=/status>Status</a>"
+	);
+#ifndef PRODUCTION_MODE
+	for (int i = 0; i < XOR_BLOCK_NUM; i++) {
+		W("<li><a href=/blockinfo?block=%d>XOR block #%d</a>",i,i);
+	}
+#endif
+	W(
+	"</ul>"
+	);
+	W("<p>By avkuzin@rt-dc.ru 2024-10-04</p>");
 	W("</body>");
 	W("</html>");
 
@@ -419,7 +493,7 @@ int www_blockinfo_handler(struct evhttp_request *req, struct evbuffer *buf) {
 		for (url = (&urls)->tqh_first; url; url = url->next.tqe_next) {
 			if (strcmp("block", url->key) == 0) { block = url->value; continue; }
 		}
-	};
+	} else return HTTP_BADREQUEST;
 
 	if (!block) return HTTP_BADREQUEST; // HTTP 400
 
@@ -454,3 +528,320 @@ int www_blockinfo_handler(struct evhttp_request *req, struct evbuffer *buf) {
 	return HTTP_OK;
 } // www_status_handler()
 #endif
+
+
+/*
+ * HTTP URL: /www_encrypt_handler
+ * Encrypt data block
+ */
+int www_encrypt_handler(struct evhttp_request *req, struct evbuffer *buf) {
+	TRACEFUNC
+	if (!req || !buf) return HTTP_INTERNAL;
+
+	struct evbuffer *reqinbuf;
+	int http_ret = HTTP_OK;
+
+	unsigned char *input_buf = NULL;
+	size_t input_len = 0;
+	size_t input_size = 0;
+
+	unsigned char *crypto_buf = NULL;
+	size_t crypto_len = 0;
+	size_t crypto_size = 0;
+
+	int key_pos = rand();
+	int iv_pos = rand();
+	unsigned char key[32];
+	unsigned char iv[16];
+
+	if (evhttp_request_get_command(req) != EVHTTP_REQ_POST) {
+		return HTTP_BADMETHOD;
+	}
+
+	if (get_gen_crypt_part(key_pos, key, sizeof(key)) == NULL
+		|| get_gen_crypt_part(iv_pos, iv, sizeof(iv)) == NULL) {
+		return HTTP_INTERNAL;
+	};
+
+	input_size = 1024;
+	input_buf = malloc(input_size);
+	if (!input_buf) {
+		DEBUG("Can't allocate memory %ld\n", input_size);
+		return HTTP_INTERNAL;
+	}
+
+	reqinbuf = evhttp_request_get_input_buffer(req);
+
+	while (evbuffer_get_length(reqinbuf)) {
+		unsigned char buf[256];
+		int n;
+		n = evbuffer_remove(reqinbuf, buf, sizeof(buf));
+		if (n > 0) {
+			if (input_len + n >= input_size) {
+				unsigned char *r;
+				r = realloc(input_buf, input_size * 2);
+				if (!r) {
+					http_ret = HTTP_INTERNAL;
+					goto _exit;
+				}
+				input_buf = r;
+				input_size *= 2;
+			}
+			memcpy(input_buf + input_len, buf, n);
+			input_len += n;
+		}
+	};
+
+	crypto_size = input_len + 128; // extra space for encryption padding & any addon data
+	crypto_buf = malloc(crypto_size);
+	if (!crypto_buf) {
+		// ERR_print_errors_fp(stderr);
+		http_ret = HTTP_INTERNAL;
+		goto _exit;
+	}
+
+	memcpy(crypto_buf, &key_pos, sizeof(int));
+	crypto_len += sizeof(int);
+	
+	memcpy(crypto_buf + crypto_len, &iv_pos, sizeof(int));
+	crypto_len += sizeof(int);
+	
+
+/////// MAKE AES 256 CBC ////////
+	EVP_CIPHER_CTX *ctx = NULL;
+
+	if(!(ctx = EVP_CIPHER_CTX_new())) {
+		// ERR_print_errors_fp(stderr);
+		http_ret = HTTP_INTERNAL;
+		goto _exit;
+	}
+
+	if(1 != EVP_EncryptInit_ex(ctx, EVP_aes_256_cbc(), NULL, key, iv)) {
+		// ERR_print_errors_fp(stderr);
+		http_ret = HTTP_INTERNAL;
+		goto _exit;
+	}
+
+	int len;
+	if(1 != EVP_EncryptUpdate(ctx, crypto_buf + crypto_len, &len, input_buf, input_len)) {
+		// ERR_print_errors_fp(stderr);
+		http_ret = HTTP_INTERNAL;
+		goto _exit;
+	}
+	crypto_len += len;
+
+	if(1 != EVP_EncryptFinal_ex(ctx, crypto_buf + crypto_len, &len)) {
+		// ERR_print_errors_fp(stderr);
+		http_ret = HTTP_INTERNAL;
+		goto _exit;
+	}
+	crypto_len += len;
+		
+	EVP_CIPHER_CTX_free(ctx);
+	ctx = NULL;
+///////////////
+	// W("<pre>");
+	// W("key = %d\n", key_pos);
+	// W("iv = %d\n", iv_pos);
+	// W("length = %ld\n", input_len);
+	// W("size = %ld\n", input_size);
+	// W("crypto_length = %ld\n", crypto_len);
+	// W("crypto_size = %ld\n", crypto_size);
+
+	// W("Original:\n");
+	// for (size_t i = 0; i < input_len; i++) {
+	// 	if (i % 16 == 0 && i > 0) W("\n");
+	// 	W("%02X ", (char)input_buf[i] & 0xFF);
+	// }
+
+	// W("\n\nCrypto:\n");
+	unsigned char b64line[75];
+	size_t b64line_len = 0;
+	size_t remain = crypto_len;
+	unsigned char *p = crypto_buf, *o = b64line;
+	while (remain >= 3) {
+		*o++ = base64[p[0] >> 2];
+		*o++ = base64[((p[0] & 0x03) << 4) | (p[1] >> 4)];
+		*o++ = base64[((p[1] & 0x0F) << 2) | (p[2] >> 6)];
+		*o++ = base64[p[2] & 0x3F];
+		remain -= 3;
+		p+=3;
+		b64line_len += 4;
+		if (b64line_len >= 72) {
+			*o++ = '\0';
+			W("%s\n",b64line);
+			o = b64line;
+			b64line_len = 0;
+		}
+	}
+	if (remain > 0) {
+		*o++ = base64[p[0] >> 2];
+		if (remain == 1) {
+			*o++ = base64[(p[0] & 0x03) << 4];
+			*o++ = '=';
+		} else {
+			*o++ = base64[((p[0] & 0x03) << 4) | (p[1] >> 4)];
+			*o++ = base64[(p[1] & 0x0F) << 2];
+		}
+		*o++ = '=';
+		b64line_len += 4;
+	}
+	*o++ = '\0';
+	if (b64line_len > 0) W("%s\n",b64line);
+
+	// for (size_t i = 0; i < crypto_len; i++) {
+	// 	if (i % 16 == 0 && i > 0) W("\n");
+	// 	W("%02X ", (char)crypto_buf[i] & 0xFF);
+	// }
+
+	// W("</pre>");
+
+_exit:
+	if (input_buf) free(input_buf);
+	if (crypto_buf) free(crypto_buf);
+	if (ctx) EVP_CIPHER_CTX_free(ctx);
+	return http_ret;
+} // www_encrypt_handler()
+
+
+/*
+ * HTTP URL: /www_decrypt_handler
+ * Decrypt data block
+ */
+int www_decrypt_handler(struct evhttp_request *req, struct evbuffer *buf) {
+	TRACEFUNC
+	if (!req || !buf) return HTTP_INTERNAL;
+
+	struct evbuffer *reqinbuf;
+	int http_ret = HTTP_OK;
+	int key_pos = 0;
+	int iv_pos = 0;
+	unsigned char key[32];
+	unsigned char iv[16];
+
+	if (evhttp_request_get_command(req) != EVHTTP_REQ_POST) {
+		return HTTP_BADMETHOD;
+	}
+
+	unsigned char *input_buf = NULL;
+	size_t input_len = 0;
+	size_t input_size = 0;
+
+	unsigned char *crypto_buf = NULL;
+	size_t crypto_size = 0;
+
+	input_size = 1024;
+	input_buf = malloc(input_size);
+	if (!input_buf) {
+		DEBUG("Can't allocate memory %ld\n", input_size);
+		return HTTP_INTERNAL;
+	}
+
+	reqinbuf = evhttp_request_get_input_buffer(req);
+	while (evbuffer_get_length(reqinbuf)) {
+		unsigned char buf[256];
+		int n;
+		n = evbuffer_remove(reqinbuf, buf, sizeof(buf));
+		if (n > 0) {
+			if (input_len + n >= input_size) {
+				unsigned char *r;
+				r = realloc(input_buf, input_size * 2);
+				if (!r) {
+					http_ret = HTTP_INTERNAL;
+					goto _exit;
+				}
+				input_buf = r;
+				input_size *= 2;
+			}
+			memcpy(input_buf + input_len, buf, n);
+			input_len += n;
+		}
+	};
+
+	// base64dec
+	size_t out_len = 0;
+	unsigned char block[4];
+	unsigned char ch;
+	int pos = 0;
+	unsigned char *out = input_buf;
+	int pad = 0;
+	for (size_t i = 0; i < input_len; i++) {
+		ch = base64dec[input_buf[i]];
+		if (ch == 0x80) continue; // skip unknown chars
+		if (input_buf[i] == '=') pad++;
+		block[pos++] = ch;
+		if (pos == 4) {
+			*out++ = (block[0] << 2) | (block[1] >> 4);
+			*out++ = (block[1] << 4) | (block[2] >> 2);
+			*out++ = (block[2] << 6) | block[3];
+			pos = 0;
+			if (pad) {
+				if (pad == 1) out--;
+				else if (pad == 2) out -= 2;
+				break;
+			}
+		}
+	}
+	out_len = out - input_buf;
+
+	memcpy(&key_pos, input_buf, sizeof(int));
+	out_len -= sizeof(int);
+	memcpy(&iv_pos, input_buf + sizeof(int), sizeof(int));
+	out_len -= sizeof(int);
+
+	crypto_size = out_len;
+	crypto_buf = malloc(crypto_size);
+	if (!crypto_buf) {
+		// ERR_print_errors_fp(stderr);
+		http_ret = HTTP_INTERNAL;
+		goto _exit;
+	}
+
+	if (get_gen_crypt_part(key_pos, key, sizeof(key)) == NULL
+		|| get_gen_crypt_part(iv_pos, iv, sizeof(iv)) == NULL) {
+		http_ret = HTTP_INTERNAL;
+		goto _exit;
+	};
+
+/// AES 256 DEC ///
+	EVP_CIPHER_CTX *ctx = NULL;
+
+	if(!(ctx = EVP_CIPHER_CTX_new())) {
+		// ERR_print_errors_fp(stderr);
+		http_ret = HTTP_INTERNAL;
+		goto _exit;
+	}
+
+	if(1 != EVP_DecryptInit_ex(ctx, EVP_aes_256_cbc(), NULL, key, iv)) {
+		// ERR_print_errors_fp(stderr);
+		http_ret = HTTP_INTERNAL;
+		goto _exit;
+	}
+
+	int len;
+	if(1 != EVP_DecryptUpdate(ctx, crypto_buf, &len, input_buf + 2 * sizeof(int), out_len)) {
+		// ERR_print_errors_fp(stderr);
+		http_ret = HTTP_INTERNAL;
+		goto _exit;
+	}
+	out_len = len;
+
+	if(1 != EVP_DecryptFinal_ex(ctx, crypto_buf + len, &len)) {
+		// ERR_print_errors_fp(stderr);
+		http_ret = HTTP_INTERNAL;
+		goto _exit;
+	}
+	out_len += len;
+
+	EVP_CIPHER_CTX_free(ctx);
+	ctx = NULL;
+///////////////////
+
+	evbuffer_add(buf,crypto_buf,out_len);
+
+_exit:	
+	if (input_buf) free(input_buf);
+	if (crypto_buf) free(crypto_buf);
+	if (ctx) EVP_CIPHER_CTX_free(ctx);
+	return http_ret;
+} // www_decrypt_handler()

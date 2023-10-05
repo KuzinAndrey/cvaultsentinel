@@ -11,7 +11,7 @@ if [ ! -r gen_table.h ]; then
 	echo "#ifndef _CVAULTSENTINEL_GEN_TABLE_H_" > gen_table.h
 	echo "#define _CVAULTSENTINEL_GEN_TABLE_H_" >> gen_table.h
 	echo "unsigned char gen_crypt[] = {" >> gen_table.h
-	dd if=/dev/urandom bs=1K count=1 status=none | xxd -i >> gen_table.h
+	dd if=/dev/urandom bs=1M count=1 status=none | xxd -i >> gen_table.h
 	echo "};" >> gen_table.h
 	echo "const unsigned long gen_crypt_size = sizeof(gen_crypt) / sizeof(gen_crypt[0]);" >> gen_table.h
 	echo "#endif /*_CVAULTSENTINEL_GEN_TABLE_H_*/" >> gen_table.h
