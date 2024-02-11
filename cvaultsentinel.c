@@ -319,7 +319,14 @@ int main(int argc, char **argv) {
 		fprintf(stderr, "Error: can't call http_bind_socket()\n");
 		return 1;
 	};
-	
+
+#ifdef PRODUCTION_MODE
+	if (daemon(0, 0) != 0) {
+		fprintf(stderr,"Can't daemonize process!\n");
+		return 7;
+	};
+#endif
+
 	for (int i = 0; i < HTTP_THREADS_CAP; i++) {
 		workers[i].id = i;
 
@@ -355,16 +362,9 @@ int main(int argc, char **argv) {
 			fprintf(stderr, "Error: can't create pthread with %s()\n","xor_block");
 			return 6;
 		}
-		DEBUG("Thread #%d = %ld (num = %d)\n", i, xor_data[i].thread, xor_data[i].num);
+		DEBUG("Thread #%d = %p (num = %d)\n", i, (void *)xor_data[i].thread, xor_data[i].num);
 	}
 	http_server_running = 1;
-
-#ifdef PRODUCTION_MODE
-	if (daemon(0, 0) != 0) {
-		fprintf(stderr,"Can't daemonize process!\n");
-		return 7;
-	};
-#endif
 
 	for (int i = 0; i < sizeof(sig_array) / sizeof(sig_array[0]); i++)
 		signal(sig_array[i], signal_handler);
@@ -687,7 +687,7 @@ int www_encrypt_handler(struct evhttp_request *req, struct evbuffer *buf) {
 		b64line_len += 4;
 	}
 	*o++ = '\0';
-	if (b64line_len > 0) W("%s\n",b64line);
+	if (b64line_len > 0) W("%s",b64line);
 
 	// for (size_t i = 0; i < crypto_len; i++) {
 	// 	if (i % 16 == 0 && i > 0) W("\n");
@@ -710,7 +710,10 @@ _exit:
  */
 int www_decrypt_handler(struct evhttp_request *req, struct evbuffer *buf) {
 	TRACEFUNC
-	if (!req || !buf) return HTTP_INTERNAL;
+	if (!req || !buf) {
+		DEBUG("Error: empty input parameters\n");
+		return HTTP_INTERNAL;
+	}
 
 	struct evbuffer *reqinbuf;
 	int http_ret = HTTP_OK;
@@ -747,6 +750,7 @@ int www_decrypt_handler(struct evhttp_request *req, struct evbuffer *buf) {
 				unsigned char *r;
 				r = realloc(input_buf, input_size * 2);
 				if (!r) {
+					DEBUG("Can't realloc memory %ld\n", input_size * 2);
 					http_ret = HTTP_INTERNAL;
 					goto _exit;
 				}
@@ -792,27 +796,32 @@ int www_decrypt_handler(struct evhttp_request *req, struct evbuffer *buf) {
 	crypto_size = out_len;
 	crypto_buf = malloc(crypto_size);
 	if (!crypto_buf) {
-		// ERR_print_errors_fp(stderr);
+		DEBUG("Can't allocate memory %ld\n", crypto_size);
 		http_ret = HTTP_INTERNAL;
 		goto _exit;
 	}
 
 	if (get_gen_crypt_part(key_pos, key, sizeof(key)) == NULL
 		|| get_gen_crypt_part(iv_pos, iv, sizeof(iv)) == NULL) {
+		DEBUG("Can't get keys key_pos=%d, iv_pos=%d\n", key_pos, iv_pos);
 		http_ret = HTTP_INTERNAL;
 		goto _exit;
+	} else {
+		DEBUG("Get keys key_pos=%d, iv_pos=%d\n", key_pos, iv_pos);
 	};
 
 /// AES 256 DEC ///
 	EVP_CIPHER_CTX *ctx = NULL;
 
 	if(!(ctx = EVP_CIPHER_CTX_new())) {
+		DEBUG("OpenSSL error on line %d\n",__LINE__);
 		// ERR_print_errors_fp(stderr);
 		http_ret = HTTP_INTERNAL;
 		goto _exit;
 	}
 
 	if(1 != EVP_DecryptInit_ex(ctx, EVP_aes_256_cbc(), NULL, key, iv)) {
+		DEBUG("OpenSSL error on line %d\n",__LINE__);
 		// ERR_print_errors_fp(stderr);
 		http_ret = HTTP_INTERNAL;
 		goto _exit;
@@ -820,6 +829,7 @@ int www_decrypt_handler(struct evhttp_request *req, struct evbuffer *buf) {
 
 	int len;
 	if(1 != EVP_DecryptUpdate(ctx, crypto_buf, &len, input_buf + 2 * sizeof(int), out_len)) {
+		DEBUG("OpenSSL error on line %d\n",__LINE__);
 		// ERR_print_errors_fp(stderr);
 		http_ret = HTTP_INTERNAL;
 		goto _exit;
@@ -827,6 +837,7 @@ int www_decrypt_handler(struct evhttp_request *req, struct evbuffer *buf) {
 	out_len = len;
 
 	if(1 != EVP_DecryptFinal_ex(ctx, crypto_buf + len, &len)) {
+		DEBUG("OpenSSL error on line %d\n",__LINE__);
 		// ERR_print_errors_fp(stderr);
 		http_ret = HTTP_INTERNAL;
 		goto _exit;
@@ -839,7 +850,7 @@ int www_decrypt_handler(struct evhttp_request *req, struct evbuffer *buf) {
 
 	evbuffer_add(buf,crypto_buf,out_len);
 
-_exit:	
+_exit:
 	if (input_buf) free(input_buf);
 	if (crypto_buf) free(crypto_buf);
 	if (ctx) EVP_CIPHER_CTX_free(ctx);
