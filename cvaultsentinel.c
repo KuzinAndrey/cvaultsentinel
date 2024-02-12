@@ -117,8 +117,14 @@ int http_bind_socket() {
 
 	struct sockaddr_in addr = {0};
 	addr.sin_family = AF_INET;
-	addr.sin_addr.s_addr = htonl(INADDR_ANY); //INADDR_LOOPBACK); // INADDR_ANY;
 	addr.sin_port = htons(HTTP_LISTEN_PORT);
+
+#ifdef PRODUCTION_MODE
+	// listen only locally for production (we don't use HTTPS)
+	addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+#else
+	addr.sin_addr.s_addr = htonl(INADDR_ANY);
+#endif
 
 	r = bind(sockfd, (struct sockaddr*)&addr, sizeof(addr));
 	if (r < 0) {
