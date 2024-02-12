@@ -202,6 +202,7 @@ void http_process_request(struct evhttp_request *req, void *arg) {
 	const char *http_message = "Page not found";
 	const char *conttype = "text/html;charset=utf-8";
 	struct evhttp_uri *uri_parsed = NULL;
+	int expire = 0;
 
 	uri_parsed = evhttp_uri_parse(req->uri);
 	if (!uri_parsed) {
@@ -236,9 +237,7 @@ void http_process_request(struct evhttp_request *req, void *arg) {
 
 	switch (http_code) {
 	case HTTP_OK:
-		evhttp_add_header(req->output_headers, "Expires", "Mon, 01 Jan 1995 00:00:00 GMT");
-		evhttp_add_header(req->output_headers, "Cache-Control", "no-cache, must-revalidate");
-		evhttp_add_header(req->output_headers, "Pragma", "no-cache");
+		expire = 1;
 		if (strlen(conttype) > 0) {
 			evhttp_add_header(req->output_headers, "Content-type", conttype);
 		};
@@ -248,12 +247,20 @@ void http_process_request(struct evhttp_request *req, void *arg) {
 	case HTTP_UNAUTHORIZED: http_message = "Unauthorized"; break;
 	case HTTP_BADREQUEST: http_message = "Wrong request"; break;
 	case HTTP_NOTFOUND: http_message = "Not found"; break;
-	case HTTP_MOVEPERM: http_message = "Moved Permanently"; break;
+	case HTTP_MOVEPERM: expire = 1; http_message = "Moved Permanently"; break;
+	case HTTP_MOVETEMP: expire = 1; http_message = "Moved Temporarily"; break;
 	case HTTP_BADMETHOD: http_message = "Bad method"; break;
 	default:
 		http_code = HTTP_INTERNAL;
 		http_message = "Internal server error";
 	} // switch
+
+	if (expire == 1) {
+		evhttp_add_header(req->output_headers, "Expires", "Mon, 01 Jan 1995 00:00:00 GMT");
+		evhttp_add_header(req->output_headers, "Cache-Control", "no-cache, must-revalidate");
+		evhttp_add_header(req->output_headers, "Pragma", "no-cache");
+	};
+
 	evhttp_send_reply(req, http_code, http_message, buf);
 
 	if (buf) evbuffer_free(buf);
@@ -1005,7 +1012,7 @@ int save_shamir_key(const char *k) {
 	key_num = *k - '0';
 	if (key_num < 1 || key_num > 5) return -3; // Wrong key number
 	key_num -= 1;
-	DEBUG("key %d = %s\n", key_num + 1, k + 1);
+	DEBUG("key %d = %c%c%c%c...\n", key_num+1, *(k+1), *(k+2), *(k+3), *(k+4));
 
 	// base64dec
 	char block[4];
@@ -1179,7 +1186,6 @@ void destroy_shamir() {
  */
 int www_shamir_handler(struct evhttp_request *req, struct evbuffer *buf) {
 	TRACEFUNC
-
 	if (!req || !buf) return HTTP_INTERNAL;
 	int ret = HTTP_INTERNAL;
 
@@ -1192,14 +1198,13 @@ int www_shamir_handler(struct evhttp_request *req, struct evbuffer *buf) {
 	struct evkeyvalq urls;
 	struct evkeyval *url;
 	const char *uri;
-
-	char *shamir_key = NULL;
+	char *request_key = NULL;
 	int saved = 0;
 
 	uri = evhttp_request_get_uri(req);
 	if (uri && evhttp_parse_query(uri, &urls) == 0) {
 		for (url = (&urls)->tqh_first; url; url = url->next.tqe_next) {
-			if (strcmp("key", url->key) == 0) { shamir_key = url->value; continue; }
+			if (strcmp("key", url->key) == 0) { request_key = url->value; continue; }
 			if (strcmp("saved", url->key) == 0) { saved = 1; continue; }
 		}
 	} else {
@@ -1207,8 +1212,10 @@ int www_shamir_handler(struct evhttp_request *req, struct evbuffer *buf) {
 		goto _exit;
 	}
 
-	if (shamir_key) {
-		if (0 == save_shamir_key(shamir_key)) {
+	if (request_key) {
+		DEBUG("Shamir key analyze: %c%c%c%c...\n", *request_key, *(request_key+1), *(request_key+2), *(request_key+3));
+		int r = save_shamir_key(request_key);
+		if (0 == r) {
 			if (open_shamir() == 0) {
 				shamir_open = 1;
 				destroy_shamir();
@@ -1216,8 +1223,11 @@ int www_shamir_handler(struct evhttp_request *req, struct evbuffer *buf) {
 			} else {
 				evhttp_add_header(req->output_headers, "Location", "/shamir?saved=1");
 			}
-			ret = HTTP_MOVEPERM;
-		} else ret = HTTP_INTERNAL;
+			ret = HTTP_MOVETEMP;
+		} else {
+			DEBUG("Wrong return from save_shamir_key() = %d\n", r);
+			ret = HTTP_INTERNAL;
+		}
 		goto _exit;
 	} else {
 		W("<html>");
@@ -1235,8 +1245,8 @@ int www_shamir_handler(struct evhttp_request *req, struct evbuffer *buf) {
 			W("<p><font color=green>Save key successfully</font></p>");
 		}
 
-		W("<form action=/shamir method=get>");
-		W("<p>Enter your shared key here: <input type=text name=key> ");
+		W("<form action=\"/shamir\" method=get>");
+		W("<p>Enter your shared key here: <input type=password name=key> ");
 		W("<input type=submit value=Send>");
 		W("</form>");
 
