@@ -11,10 +11,10 @@ while [ $COUNT -gt 0 ]; do
 	dd if=/dev/urandom bs=1 count=$S status=none > $F
 	[ $? != 0 ] && echo CURL_ERROR && break
 
-	curl -s --data-binary @${F} -X POST http://localhost:6969/encrypt > $F1
+	curl -s --data-binary @${F} -X POST http://127.0.0.1:6969/encrypt > $F1
 	[ $? != 0 ] && echo CURL_ERROR && break
 
-	curl -s --data-binary @${F1} -X POST http://localhost:6969/decrypt > $F2
+	curl -s --data-binary @${F1} -X POST http://127.0.0.1:6969/decrypt > $F2
 	[ $? != 0 ] && echo CURL_ERROR && break
 
 	if ! cmp $F $F2 ; then

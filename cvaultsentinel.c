@@ -1,7 +1,11 @@
 /*
  * CVaultSentinel HTTP API daemon (for encrypt/decrypt data)
  *
- * Author: Kuzin Andrey, 2023-10-02
+ * Author: Kuzin Andrey <kuzinandrey@yandex.ru>
+ *
+ * 2023-10-02 - Initial release
+ * 2024-02-11 - Add support of Shamir Shared Secrets
+ *
  */
 
 #include <stdio.h>
@@ -21,7 +25,18 @@
 #include <openssl/evp.h>
 #include <openssl/err.h>
 
+#ifndef SHAMIR_MODE
 #include "gen_table.h"
+#else
+#include <ctype.h>
+#include <openssl/sha.h>
+#include "shamir.h"
+#include "gen_table_shamir.h"
+int save_shamir_key(const char *);
+int open_shamir();
+void destroy_shamir();
+pthread_mutex_t shamir_mutex;
+#endif
 
 #ifdef PRODUCTION_MODE
 #define TRACEFUNC
@@ -33,13 +48,18 @@
 #define DEBUG(...) fprintf(stderr, __VA_ARGS__);
 #endif
 
+// working threads for web handlers
+#ifndef HTTP_THREADS_CAP
 #define HTTP_THREADS_CAP 2
+#endif
+
 #define HTTP_LISTEN_PORT 6969
 #define HTTP_MAX_CONNECTIONS 1024
 
 #define W(...) evbuffer_add_printf(buf, __VA_ARGS__)
 
 #define PROJECT_TITLE "CVaultSentinel"
+#define PROJECT_VERSION "v0.2"
 
 #define HTTP_UNAUTHORIZED 401
 
@@ -70,6 +90,8 @@ struct http_worker {
 	struct evhttp *http;
 
 	size_t request_count;
+	size_t encrypt_count;
+	size_t decrypt_count;
 	size_t send_bytes;
 }; // struct http_worker
 
@@ -95,7 +117,7 @@ int http_bind_socket() {
 
 	struct sockaddr_in addr = {0};
 	addr.sin_family = AF_INET;
-	addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK); // INADDR_ANY;
+	addr.sin_addr.s_addr = htonl(INADDR_ANY); //INADDR_LOOPBACK); // INADDR_ANY;
 	addr.sin_port = htons(HTTP_LISTEN_PORT);
 
 	r = bind(sockfd, (struct sockaddr*)&addr, sizeof(addr));
@@ -131,11 +153,15 @@ void *http_dispatch(void *arg) {
 // HTTP callbacks definitions
 typedef int (*function_url_handler_t)(struct evhttp_request *, struct evbuffer *);
 int www_root_handler(struct evhttp_request *, struct evbuffer *);
+int www_info_handler(struct evhttp_request *, struct evbuffer *);
 int www_status_handler(struct evhttp_request *, struct evbuffer *);
 int www_encrypt_handler(struct evhttp_request *, struct evbuffer *);
 int www_decrypt_handler(struct evhttp_request *, struct evbuffer *);
 #ifndef PRODUCTION_MODE
 int www_blockinfo_handler(struct evhttp_request *, struct evbuffer *);
+#endif
+#ifdef SHAMIR_MODE
+int www_shamir_handler(struct evhttp_request *, struct evbuffer *);
 #endif
 
 // Array of URL's served by HTTP
@@ -145,11 +171,15 @@ struct http_uri {
 	function_url_handler_t handler;
 } http_uri_list[] = {
 	{ "/", NULL, &www_root_handler}
-	,{ "/status", NULL, &www_status_handler}
+	,{ "/info", NULL, &www_info_handler}
+	,{ "/status", "text/plain", &www_status_handler}
 	,{ "/encrypt", NULL, &www_encrypt_handler}
 	,{ "/decrypt", NULL, &www_decrypt_handler}
 #ifndef PRODUCTION_MODE
 	,{ "/blockinfo", NULL, &www_blockinfo_handler}
+#endif
+#ifdef SHAMIR_MODE
+	,{ "/shamir", NULL, &www_shamir_handler}
 #endif
 	,{ NULL, NULL, NULL} // end of list
 }; // http_uri_list
@@ -187,13 +217,17 @@ void http_process_request(struct evhttp_request *req, void *arg) {
 			if (0 == strcmp(path, u->uri)) {
 				if (u->content_type) conttype = u->content_type;
 				http_code = u->handler(req, buf);
+				if (http_code == HTTP_OK) {
+					if (*(path+1) == 'e') w->encrypt_count++;
+					else if (*(path+1) == 'd') w->decrypt_count++;
+				}
 				break;
 			}
 			u++;
 		} // while
 		free(path);
 	} else http_code = HTTP_INTERNAL;
-	
+
 	switch (http_code) {
 	case HTTP_OK:
 		evhttp_add_header(req->output_headers, "Expires", "Mon, 01 Jan 1995 00:00:00 GMT");
@@ -245,9 +279,17 @@ void *xor_block(void *data) {
 	DEBUG("block = %d\n",me->num);
 	while (http_server_running != 1) {};
 
+#ifdef SHAMIR_MODE
+	while (!shamir_open && http_server_running) sleep(1);
+	if (!http_server_running) {
+		pthread_exit(NULL);
+		return NULL;
+	}
+#endif
+
 	size_t myblock_len = gen_crypt_size / sizeof(uint32_t) / XOR_BLOCK_NUM;
 	uint32_t *myblock = (uint32_t *)&gen_crypt[me->num * (gen_crypt_size / XOR_BLOCK_NUM)];
-	
+
 	while (http_server_running) {
 		uint32_t new_xor_code = rand();
 		pthread_mutex_lock(&me->mutex);
@@ -354,6 +396,10 @@ int main(int argc, char **argv) {
 		};
 	} // for accept
 
+#ifdef SHAMIR_MODE
+	pthread_mutex_init(&shamir_mutex, NULL);
+#endif
+
 	for (int i = 0; i < XOR_BLOCK_NUM; i++) {
 		xor_data[i].num = i;
 		xor_data[i].key = 0;
@@ -392,6 +438,7 @@ int main(int argc, char **argv) {
 	return 0;
 } // main()
 
+
 /*
  * HTTP URL: /
  * Main page of HTTP server
@@ -402,23 +449,47 @@ int www_root_handler(struct evhttp_request *req, struct evbuffer *buf) {
 
 	W("<html>");
 	W("<head>");
-	W("<title>%s</title>",PROJECT_TITLE);
+	W("<title>%s (%s)</title>", PROJECT_TITLE, PROJECT_VERSION);
 	W("</head>");
 	W("<body bgcolor=white link=blue>");
-	W("<h1>%s</h1>",PROJECT_TITLE);
+	W("<h1>%s (%s)</h1>", PROJECT_TITLE, PROJECT_VERSION);
+
+#ifdef SHAMIR_MODE
+	struct evkeyvalq urls;
+	struct evkeyval *url;
+	const char *uri;
+	int open_message = 0;
+	uri = evhttp_request_get_uri(req);
+	if (uri && evhttp_parse_query(uri, &urls) == 0) {
+		for (url = (&urls)->tqh_first; url; url = url->next.tqe_next) {
+			if (strcmp("open", url->key) == 0) { open_message = 1; continue; }
+		}
+	} else return HTTP_BADREQUEST;
+	evhttp_clear_headers(&urls);
+
+	if (open_message && shamir_open)
+		W("<p><font color=green><b>SHAMIR SECRET OPEN SUCCESS</b></font></p>");
+
+	if (!shamir_open) W("<font color=red>SHAMIR SECRET UNKNOWN - ALL WORK IS BLOCKED</font>");
+#endif
 
 	W("<ul>"
-	"<li><a href=/status>Status</a>"
+	"<li><a href=/info>Information page</a></li>"
+	"<li><a href=/status>Status for monitoring</a></li>"
 	);
+#ifdef SHAMIR_MODE
+	if (!shamir_open)
+		W("<li><a href=/shamir>Enter Shamir secret</a></li>");
+#endif
 #ifndef PRODUCTION_MODE
 	for (int i = 0; i < XOR_BLOCK_NUM; i++) {
-		W("<li><a href=/blockinfo?block=%d>XOR block #%d</a>",i,i);
+		W("<li><a href=/blockinfo?block=%d>XOR block #%d</a></li>", i, i);
 	}
 #endif
 	W(
 	"</ul>"
 	);
-	W("<p>By avkuzin@rt-dc.ru 2024-10-04</p>");
+	W("<p>By kuzinandrey@yandex.ru 2024-02-11</p>");
 	W("</body>");
 	W("</html>");
 
@@ -427,10 +498,10 @@ int www_root_handler(struct evhttp_request *req, struct evbuffer *buf) {
 
 
 /*
- * HTTP URL: /status
- * Statistics page for HTTP server
+ * HTTP URL: /info
+ * Information page for HTTP server
  */
-int www_status_handler(struct evhttp_request *req, struct evbuffer *buf) {
+int www_info_handler(struct evhttp_request *req, struct evbuffer *buf) {
 	TRACEFUNC
 
 	if (!req || !buf) return HTTP_INTERNAL;
@@ -440,33 +511,66 @@ int www_status_handler(struct evhttp_request *req, struct evbuffer *buf) {
 
 	W("<html>");
 	W("<head>");
-	W("<title>%s: %s</title>",PROJECT_TITLE,"Status page");
+	W("<title>%s: %s</title>",PROJECT_TITLE,"Information page");
 	W("</head>");
 	W("<body bgcolor=white link=blue>");
-	W("<h1>%s: %s</h1>",PROJECT_TITLE,"Status page");
-	W("<pre>");
+	W("<h1>%s (%s): %s</h1>", PROJECT_TITLE, PROJECT_VERSION, "Information page");
+
+#ifdef SHAMIR_MODE
+	if (!shamir_open) W("<h3><font color=red>SHAMIR SECRET UNKNOWN - ALL WORK IS BLOCKED</font></h3>");
+#endif
+
 	time_t now_time = time(NULL);
 	localtime_r(&global_start_time, &tm_st);
 	sprintf(tm_buff, "%04d-%02d-%02d %02d:%02d:%02d", tm_st.tm_year + 1900, tm_st.tm_mon + 1, tm_st.tm_mday,
 		tm_st.tm_hour, tm_st.tm_min, tm_st.tm_sec);
 
-	W("Start time: %s\n", tm_buff);
-	W("Uptime: %lu secs\n", (long)(now_time - global_start_time));
-	W("Remote host: %s\n", req->remote_host);
-	W("Size of crypto table: %lu\n", gen_crypt_size);
-	W("===================\n");
+	W("<p>Start time: %s", tm_buff);
+	W("<br>Uptime: %lu secs", (long)(now_time - global_start_time));
+	W("<br>Remote host: %s", req->remote_host);
+	W("<br>Size of crypto table: %lu", gen_crypt_size);
+	W("<br>XOR protection threads: %d", XOR_BLOCK_NUM);
+	W("<br>Web threads: %d", HTTP_THREADS_CAP);
+	W("</p>");
+	W("<p>Web threads statistics:<br><table border=1>");
+	W("<tr>");
+	char *head[] = {"Web thread","Requests","Send bytes","Encrypt","Decrypt",NULL};
+	char **p = head; while(*p) { W("<th>%s</th>", *p); p++; }
+	W("</tr>");
 	for (int i = 0; i < HTTP_THREADS_CAP; i++) {
-		W("Thread #%d - requests %lu, send bytes %lu\n",
-			workers[i].id, workers[i].request_count, workers[i].send_bytes);
+		W("<tr>");
+		W("<td>#%d - %p</td>", workers[i].id, (void *)workers[i].thread);
+		W("<td>%lu</td>", workers[i].request_count);
+		W("<td>%lu</td>", workers[i].send_bytes);
+		W("<td>%lu</td>", workers[i].encrypt_count);
+		W("<td>%lu</td>", workers[i].decrypt_count);
+		W("</tr>");
 		total_req += workers[i].request_count;
 		total_bytes += workers[i].send_bytes;
 	};
-	W("===================\n"
-	"Total requests: %lu\n"
-	"Total send bytes %lu\n",
+	W("</table></p>");
+	W("<p>Total requests: %lu"
+	"<br>Total send bytes %lu"
+	"</p>",
 	total_req, total_bytes);
-	W("</pre>");
 	W("<p><a href=/>[back]</a></p>");
+
+	return HTTP_OK;
+} // www_info_handler()
+
+/*
+ * HTTP URL: /status
+ * Status page for HTTP server (for monitoring purposes)
+ */
+int www_status_handler(struct evhttp_request *req, struct evbuffer *buf) {
+	TRACEFUNC
+	if (!req || !buf) return HTTP_INTERNAL;
+#ifdef SHAMIR_MODE
+	if (!shamir_open) W("status=CLOSED\n");
+	else
+#endif
+	W("status=OK\n");
+	W("build=%s\n", build_id);
 
 	return HTTP_OK;
 } // www_status_handler()
@@ -474,13 +578,20 @@ int www_status_handler(struct evhttp_request *req, struct evbuffer *buf) {
 
 #ifndef PRODUCTION_MODE
 /*
- * HTTP URL: /www_blockinfo_handler
+ * HTTP URL: /blockinfo
  * Info page for N block of gen_crypt
  */
 int www_blockinfo_handler(struct evhttp_request *req, struct evbuffer *buf) {
 	TRACEFUNC
 
 	if (!req || !buf) return HTTP_INTERNAL;
+
+#ifdef SHAMIR_MODE
+	if (!shamir_open) {
+		DEBUG("Error: shamir is closed\n");
+		return HTTP_INTERNAL;
+	}
+#endif
 
 	struct evkeyvalq urls;
 	struct evkeyval *url;
@@ -495,16 +606,25 @@ int www_blockinfo_handler(struct evhttp_request *req, struct evbuffer *buf) {
 		}
 	} else return HTTP_BADREQUEST;
 
-	if (!block) return HTTP_BADREQUEST; // HTTP 400
+	if (!block) {
+		evhttp_clear_headers(&urls);
+		return HTTP_BADREQUEST; // HTTP 400
+	}
 
 	int num = atoi(block);
+	evhttp_clear_headers(&urls);
 
 	W("<html>");
 	W("<head>");
 	W("<title>%s: %s</title>",PROJECT_TITLE,"Block info");
 	W("</head>");
 	W("<body bgcolor=white link=blue>");
-	W("<h1>%s: %s</h1>",PROJECT_TITLE,"Block info");
+	W("<h1>%s (%s): %s</h1>", PROJECT_TITLE, PROJECT_VERSION, "Block info");
+
+#ifdef SHAMIR_MODE
+	if (!shamir_open) W("<font color=red>SHAMIR SECRET UNKNOWN - ALL WORK IS BLOCKED</font>");
+#endif
+
 	if (num >= 0 && num < XOR_BLOCK_NUM) {
 		W("<pre>");
 		W("Block #: %d\n", num);
@@ -520,7 +640,7 @@ int www_blockinfo_handler(struct evhttp_request *req, struct evbuffer *buf) {
 		W("</pre>");
 		W("<p><a href=/>[back]</a></p>");
 	} else {
-		W("<p><font color=red>Wrong block number: %d</font></p>",num);	
+		W("<p><font color=red>Wrong block number: %d</font></p>",num);
 	}
 	W("</body>");
 	W("</html>");
@@ -531,12 +651,19 @@ int www_blockinfo_handler(struct evhttp_request *req, struct evbuffer *buf) {
 
 
 /*
- * HTTP URL: /www_encrypt_handler
+ * HTTP URL: /encrypt
  * Encrypt data block
  */
 int www_encrypt_handler(struct evhttp_request *req, struct evbuffer *buf) {
 	TRACEFUNC
 	if (!req || !buf) return HTTP_INTERNAL;
+
+#ifdef SHAMIR_MODE
+	if (!shamir_open) {
+		DEBUG("Error: shamir is closed\n");
+		return HTTP_INTERNAL;
+	}
+#endif
 
 	struct evbuffer *reqinbuf;
 	int http_ret = HTTP_OK;
@@ -715,6 +842,13 @@ int www_decrypt_handler(struct evhttp_request *req, struct evbuffer *buf) {
 		return HTTP_INTERNAL;
 	}
 
+#ifdef SHAMIR_MODE
+	if (!shamir_open) {
+		DEBUG("Error: shamir is closed\n");
+		return HTTP_INTERNAL;
+	}
+#endif
+
 	struct evbuffer *reqinbuf;
 	int http_ret = HTTP_OK;
 	int key_pos = 0;
@@ -856,3 +990,269 @@ _exit:
 	if (ctx) EVP_CIPHER_CTX_free(ctx);
 	return http_ret;
 } // www_decrypt_handler()
+
+#ifdef SHAMIR_MODE
+int save_shamir_key(const char *k) {
+	int key_num = 0;
+	if (!k || strlen(k) < (SHAMIR_SECRET_SIZE * 8 / 6 + 1)) return -1; // Wrong size of key
+	if (!isdigit(*k)) return -2; // No key number
+	key_num = *k - '0';
+	if (key_num < 1 || key_num > 5) return -3; // Wrong key number
+	key_num -= 1;
+	DEBUG("key %d = %s\n", key_num + 1, k + 1);
+
+	// base64dec
+	char block[4];
+	char ch;
+	int pos = 0;
+	char *out = shamir_key[key_num];
+	int pad = 0;
+	for (size_t i = 1; i < strlen(k); i++) {
+		ch = base64dec[(unsigned char)k[i]];
+		if (ch == 0x80) continue; // skip unknown chars
+		if (k[i] == '=') pad++;
+		block[pos++] = ch;
+		if (pos == 4) {
+			*out++ = (block[0] << 2) | (block[1] >> 4);
+			*out++ = (block[1] << 4) | (block[2] >> 2);
+			*out++ = (block[2] << 6) | block[3];
+			pos = 0;
+			if (pad) {
+				if (pad == 1) out--;
+				else if (pad == 2) out -= 2;
+				break;
+			}
+		}
+	}
+	shamir_key_present[key_num] = 1;
+	return 0;
+} // save_shamir_key()
+
+int open_shamir() {
+	char restore[SHAMIR_SECRET_SIZE];
+	int found = 0;
+
+	// We need at least 3 keys to open shamir secret
+	size_t count = 0;
+	for (int i = 0; i < 5; i++) {
+		if (shamir_key_present[i] == 1) count++;
+	};
+	if (count < 3) return -1;
+
+	// Brute force key combination
+	for (int i = 0; i < 5; i++) {
+	for (int j = 0; j < 5; j++) {
+	for (int k = 0; k < 5; k++)
+	{
+		if (!shamir_key_present[i] || !shamir_key_present[j] || !shamir_key_present[k]) continue;
+		if (0 == restore_shamir_secret(restore, SHAMIR_SECRET_SIZE,
+			i + 1, shamir_key[i],
+			j + 1, shamir_key[j],
+			k + 1, shamir_key[k])
+		) {
+			unsigned char sha256test_secret[SHA256_DIGEST_LENGTH];
+			SHA256((unsigned char *)restore, SHAMIR_SECRET_SIZE, sha256test_secret);
+
+			DEBUG("Shamir secret SHA256 compare: ");
+			if (memcmp(shamir_secret_sha256, sha256test_secret, SHA256_DIGEST_LENGTH) == 0) {
+				DEBUG("OK\n");
+				found = 1;
+				break;
+			} else {
+				DEBUG("FAILED (%d,%d,%d)\n",i,j,k);
+			}
+		} else continue;
+	} if (found) break; } if (found) break;}
+
+	if (found != 1) return -2;
+
+	// DECRYPT MAIN GEN_CRYPT SPACE
+	char decrypto_by[SHAMIR_SECRET_SIZE * 2]; // 32 + 16 = 48 = 24 * 2 !!!
+	unsigned char aes_key[32];
+	unsigned char aes_iv[16];
+	/*
+	 *                 24 bytes          24 bytes
+	 * decrypto_by |    *****       |      *****      |
+	 *                    ^secret            ^secret xor sha256
+	 *
+	 *                 32 bytes             16 bytes
+	 * aes keys   |       *key*          |    *iv*   |
+	 */
+
+	memcpy(decrypto_by, restore, SHAMIR_SECRET_SIZE);
+	char *p = decrypto_by + SHAMIR_SECRET_SIZE;
+	memcpy(p, restore, SHAMIR_SECRET_SIZE);
+	for (int i = 0; i < SHAMIR_SECRET_SIZE; i++) {
+		*(p + i) ^= gen_crypt_sha256[i];
+	};
+
+	memcpy(aes_key, decrypto_by, sizeof(aes_key));
+	memcpy(aes_iv, decrypto_by + sizeof(aes_key), sizeof(aes_iv));
+
+	// clean memory from passwords
+	for (int i = 0; i < sizeof(restore); i++) restore[i] = rand() & 0xFF;
+	for (int i = 0; i < sizeof(decrypto_by); i++) decrypto_by[i] = rand() & 0xFF;
+
+	gen_crypt = malloc(gen_crypt_shamir_size);
+	if (!gen_crypt) return -3; // No memory for decryption buffer
+
+	EVP_CIPHER_CTX *ctx = NULL;
+
+	if(!(ctx = EVP_CIPHER_CTX_new())) {
+		DEBUG("OpenSSL error on line %d\n",__LINE__);
+		goto _exit;
+	}
+
+	if(1 != EVP_DecryptInit_ex(ctx, EVP_aes_256_cbc(), NULL, aes_key, aes_iv)) {
+		DEBUG("OpenSSL error on line %d\n",__LINE__);
+		goto _exit;
+	}
+
+	int len = 0;
+	if(1 != EVP_DecryptUpdate(ctx, gen_crypt, &len, gen_crypt_shamir, gen_crypt_shamir_size)) {
+		DEBUG("OpenSSL error on line %d\n",__LINE__);
+		goto _exit;
+	}
+	gen_crypt_size = len;
+
+	if(1 != EVP_DecryptFinal_ex(ctx, gen_crypt + gen_crypt_size, &len)) {
+		DEBUG("OpenSSL error on line %d\n",__LINE__);
+		goto _exit;
+	}
+	gen_crypt_size += len;
+
+	EVP_CIPHER_CTX_free(ctx);
+	ctx = NULL;
+	///////////////////
+
+	unsigned char sha256test_secret[SHA256_DIGEST_LENGTH];
+	SHA256(gen_crypt, gen_crypt_size, sha256test_secret);
+
+	DEBUG("Password space SHA256 compare: ");
+	if (memcmp(gen_crypt_sha256, sha256test_secret, SHA256_DIGEST_LENGTH) == 0) {
+		DEBUG("OK\n");
+		unsigned char *t = realloc(gen_crypt, gen_crypt_size);
+		if (t) gen_crypt = t; else {
+			DEBUG("Realloc failed %d\n",__LINE__);
+			goto _exit;
+		}
+	} else {
+		DEBUG("FAILED\n");
+		goto _exit;
+	}
+
+	return 0;
+
+_exit:
+	// clean memory from passwords
+	for (int i = 0; i < sizeof(aes_key); i++) aes_key[i] = rand() & 0xFF;
+	for (int i = 0; i < sizeof(aes_iv); i++) aes_iv[i] = rand() & 0xFF;
+
+	if (ctx) EVP_CIPHER_CTX_free(ctx);
+	if (gen_crypt) { free(gen_crypt); gen_crypt = NULL; gen_crypt_size = 0; }
+
+	return -4;
+} // open_shamir()
+
+// clear memory from sensitive shamir data
+void destroy_shamir() {
+	if (!shamir_open) return;
+	for (int i = 0; i < 5; i++) {
+		for (int j = 0; j < SHAMIR_SECRET_SIZE; j++) {
+			shamir_key[i][j] = rand() & 0xFF;
+			shamir_secret[j] = rand() & 0xFF;
+		}
+	}
+	DEBUG("Destroy shamir\n");
+} // destroy_shamir()
+
+
+/*
+ * HTTP URL: /shamir
+ * Info page for N block of gen_crypt
+ */
+int www_shamir_handler(struct evhttp_request *req, struct evbuffer *buf) {
+	TRACEFUNC
+
+	if (!req || !buf) return HTTP_INTERNAL;
+	int ret = HTTP_INTERNAL;
+
+	pthread_mutex_lock(&shamir_mutex);
+	if (shamir_open) {
+		pthread_mutex_unlock(&shamir_mutex);
+		return HTTP_NOTFOUND;
+	}
+
+	struct evkeyvalq urls;
+	struct evkeyval *url;
+	const char *uri;
+
+	char *shamir_key = NULL;
+	int saved = 0;
+
+	uri = evhttp_request_get_uri(req);
+	if (uri && evhttp_parse_query(uri, &urls) == 0) {
+		for (url = (&urls)->tqh_first; url; url = url->next.tqe_next) {
+			if (strcmp("key", url->key) == 0) { shamir_key = url->value; continue; }
+			if (strcmp("saved", url->key) == 0) { saved = 1; continue; }
+		}
+	} else {
+		ret = HTTP_BADREQUEST;
+		goto _exit;
+	}
+
+	if (shamir_key) {
+		if (0 == save_shamir_key(shamir_key)) {
+			if (open_shamir() == 0) {
+				shamir_open = 1;
+				destroy_shamir();
+				evhttp_add_header(req->output_headers, "Location", "/?open=1");
+			} else {
+				evhttp_add_header(req->output_headers, "Location", "/shamir?saved=1");
+			}
+			ret = HTTP_MOVEPERM;
+		} else ret = HTTP_INTERNAL;
+		goto _exit;
+	} else {
+		W("<html>");
+		W("<head>");
+		W("<title>%s: %s</title>",PROJECT_TITLE,"Shamir keys");
+		W("</head>");
+		W("<body bgcolor=white link=blue>");
+
+		W("<h1>%s: is closed</h1>",PROJECT_TITLE);
+
+		W("<p><font color=red>No any data can be encrypted or decrypted in closed mode !!!</font></p>");
+		W("<p>For open <b>%s</b> to work you must enter at least <b>3 shared keys</b>.</p>",PROJECT_TITLE);
+
+		if (saved) {
+			W("<p><font color=green>Save key successfully</font></p>");
+		}
+
+		W("<form action=/shamir method=get>");
+		W("<p>Enter your shared key here: <input type=text name=key> ");
+		W("<input type=submit value=Send>");
+		W("</form>");
+
+		W("<p>Data about entered shamir keys:<ul>");
+		for (int i = 0; i < 5; i++) {
+			W("<li>Key %d: %s</li>", i + 1, shamir_key_present[i] == 1 ?
+				"<font color=green>enterred</font>"
+				: "<font color=red>not enterred</font>");
+		}
+		W("</ul></p>");
+
+		W("<p><a href=/>[back]</a></p>");
+
+		W("</body>");
+		W("</html>");
+	}
+
+	ret = HTTP_OK;
+_exit:
+	evhttp_clear_headers(&urls);
+	pthread_mutex_unlock(&shamir_mutex);
+	return ret;
+} // www_shamir_handler()
+
+#endif /* SHAMIR_MODE */

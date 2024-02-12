@@ -1,2 +1,5 @@
 cvaultsentinel
 gen_table.h
+gen_table_shamir.h
+.shamir_creds.txt
+test_*/*
