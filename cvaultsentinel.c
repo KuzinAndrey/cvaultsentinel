@@ -178,7 +178,7 @@ struct http_uri {
 } http_uri_list[] = {
 	{ "/", NULL, &www_root_handler}
 	,{ "/info", NULL, &www_info_handler}
-	,{ "/status", "text/plain", &www_status_handler}
+	,{ "/status", "application/json", &www_status_handler}
 	,{ "/encrypt", NULL, &www_encrypt_handler}
 	,{ "/decrypt", NULL, &www_decrypt_handler}
 #ifndef PRODUCTION_MODE
@@ -579,12 +579,20 @@ int www_info_handler(struct evhttp_request *req, struct evbuffer *buf) {
 int www_status_handler(struct evhttp_request *req, struct evbuffer *buf) {
 	TRACEFUNC
 	if (!req || !buf) return HTTP_INTERNAL;
+	char *status = "OK";
+	int count = 0;
+
 #ifdef SHAMIR_MODE
-	if (!shamir_open) W("status=CLOSED\n");
-	else
+	if (!shamir_open) {
+		status = "CLOSED";
+		for (int i = 0; i < 5; i++) {
+			if (shamir_key_present[i] == 1) count++;
+		};
+	}
 #endif
-	W("status=OK\n");
-	W("build=%s\n", build_id);
+	W("{\"status\": \"%s\"", status);
+	W(",\"keys\": %d", count);
+	W(",\"build\": \"%s\"}", build_id);
 
 	return HTTP_OK;
 } // www_status_handler()
