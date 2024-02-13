@@ -250,6 +250,7 @@ void http_process_request(struct evhttp_request *req, void *arg) {
 	case HTTP_MOVEPERM: expire = 1; http_message = "Moved Permanently"; break;
 	case HTTP_MOVETEMP: expire = 1; http_message = "Moved Temporarily"; break;
 	case HTTP_BADMETHOD: http_message = "Bad method"; break;
+	case HTTP_SERVUNAVAIL: http_message = "Service Unavailable"; break;
 	default:
 		http_code = HTTP_INTERNAL;
 		http_message = "Internal server error";
@@ -602,7 +603,7 @@ int www_blockinfo_handler(struct evhttp_request *req, struct evbuffer *buf) {
 #ifdef SHAMIR_MODE
 	if (!shamir_open) {
 		DEBUG("Error: shamir is closed\n");
-		return HTTP_INTERNAL;
+		return HTTP_SERVUNAVAIL;
 	}
 #endif
 
@@ -674,7 +675,7 @@ int www_encrypt_handler(struct evhttp_request *req, struct evbuffer *buf) {
 #ifdef SHAMIR_MODE
 	if (!shamir_open) {
 		DEBUG("Error: shamir is closed\n");
-		return HTTP_INTERNAL;
+		return HTTP_SERVUNAVAIL;
 	}
 #endif
 
@@ -858,7 +859,7 @@ int www_decrypt_handler(struct evhttp_request *req, struct evbuffer *buf) {
 #ifdef SHAMIR_MODE
 	if (!shamir_open) {
 		DEBUG("Error: shamir is closed\n");
-		return HTTP_INTERNAL;
+		return HTTP_SERVUNAVAIL;
 	}
 #endif
 
